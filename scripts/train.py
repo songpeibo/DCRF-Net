@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Train DCSR-Net from a YAML config."""
+"""Train DCRF-Net with the standard baseline-export protocol."""
 
 from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import math
+import shutil
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -22,870 +23,731 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from datasets.baseline_export import (
+from datasets.baseline_export import (  # noqa: E402
     BaselineExportDataset,
     eval_crop_policy_description,
     normalize_eval_crop_policy,
 )
-from datasets.synthetic import SyntheticHSIMSIFusionDataset
-from models.build_model import (
-    build_model_from_config,
-    log_effective_config,
-    model_variant_label,
-    save_effective_config,
-)
-from models.dcsr_net import DCSRNet
-from utils.common import resolve_path
-from utils.logger import (
-    TRAIN_VALID_METRICS_FIELDS,
-    CSVLogger,
-    CheckpointManager,
-    collect_dcsr_diagnostics,
-    count_parameters,
-    create_run_dir,
-    format_epoch_line,
-    format_num_params,
-    get_optimizer_lr,
-    gpu_memory_gb,
-    gpu_memory_reserved_gb,
-    sam_rad_deg_pair,
-    save_args_snapshot,
-    save_config_snapshot,
-)
-from utils.losses import DCSRLoss
-from utils.metrics import ergas, psnr, rmse, sam, ssim
-from utils.seed import set_seed
-from utils.train_logging import TrainingDualLogger
+from models.build_model import build_model_from_config, save_effective_config  # noqa: E402
+from utils.common import resolve_path  # noqa: E402
+from utils.losses import DCSRLoss  # noqa: E402
+from utils.metrics import ergas, psnr, rmse, sam, ssim  # noqa: E402
+from utils.seed import set_seed  # noqa: E402
 
 
-def _collate_fusion(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    keys = batch[0].keys()
-    for k in keys:
-        vals = [b[k] for b in batch]
-        if k in ("phi0", "k0") and all(torch.equal(vals[0], v) for v in vals[1:]):
-            out[k] = vals[0]
-        elif isinstance(vals[0], torch.Tensor):
-            out[k] = torch.stack(vals, dim=0)
+LOSS_KEYS = (
+    "loss_rec",
+    "loss_rec_coarse",
+    "loss_obs",
+    "loss_obs_coarse",
+    "loss_sam",
+    "loss_deg",
+    "loss_sel",
+    "loss_feedback_intermediate",
+)
+
+CSV_FIELDS = (
+    "epoch",
+    "train_loss",
+    "val_loss",
+    *LOSS_KEYS,
+    "PSNR",
+    "SSIM",
+    "SAM_deg",
+    "RMSE",
+    "ERGAS",
+    "PSNR_coarse",
+    "PSNR_gain",
+    "lr",
+    "epoch_time_sec",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train DCRF-Net")
+    parser.add_argument("--config", required=True, help="Path to the YAML config")
+    parser.add_argument("--data-root", default=None, help="Override data.root")
+    parser.add_argument("--device", default=None, help="Override device, e.g. cuda:0 or cpu")
+    parser.add_argument("--resume", default=None, help="Checkpoint used to resume training")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing non-empty output directory",
+    )
+    return parser.parse_args()
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, dict):
+        raise ValueError(f"The config must be a YAML mapping: {path}")
+    return config
+
+
+def collate_fusion(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stack samples while keeping an identical SRF/PSF shared by the batch."""
+    if not batch:
+        raise ValueError("Cannot collate an empty batch")
+
+    output: dict[str, Any] = {}
+    for key in batch[0]:
+        values = [sample[key] for sample in batch]
+        first = values[0]
+
+        shared_operator = (
+            key in {"phi0", "k0"}
+            and isinstance(first, torch.Tensor)
+            and all(
+                isinstance(value, torch.Tensor) and torch.equal(first, value)
+                for value in values[1:]
+            )
+        )
+        if shared_operator:
+            output[key] = first
+        elif isinstance(first, torch.Tensor):
+            output[key] = torch.stack(values, dim=0)
         else:
-            out[k] = vals
-    return out
+            output[key] = values
+    return output
 
 
-def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+def move_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    return {
+        key: value.to(device, non_blocking=device.type == "cuda")
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in batch.items()
+    }
 
 
-def _cfg_get(cfg: dict[str, Any], *keys: str, default: Any = None) -> Any:
-    for k in keys:
-        if k in cfg:
-            return cfg[k]
-    return default
+def prepare_run_dir(path: Path, *, overwrite: bool, resume: bool) -> None:
+    if resume:
+        path.mkdir(parents=True, exist_ok=True)
+        return
+
+    if path.exists() and any(path.iterdir()):
+        if not overwrite:
+            raise FileExistsError(
+                f"Output directory is not empty: {path}\n"
+                "Use --overwrite or set train.overwrite: true."
+            )
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def _na(value: Any) -> str:
-    if value is None:
-        return "N/A"
-    if isinstance(value, float) and not math.isfinite(value):
-        return "N/A"
-    return str(value)
-
-
-def _fmt_csv(x: float) -> str:
-    if not math.isfinite(x):
-        return "NaN"
-    return f"{x:.8f}"
-
-
-def _validation_eval_shape(val_set: Any) -> str:
-    if not isinstance(val_set, BaselineExportDataset) or len(val_set) < 1:
-        return "N/A"
-    sample = val_set[0]
-    gt = sample["gt"]
-    if not isinstance(gt, torch.Tensor) or gt.ndim != 3:
-        return "N/A"
-    c, h, w = int(gt.shape[0]), int(gt.shape[1]), int(gt.shape[2])
-    return f"{c}x{h}x{w}"
-
-
-def _build_datasets(cfg: dict[str, Any], root: Path) -> tuple[Any, Any, str, str, str]:
-    dcfg = cfg.get("data", {})
-    scale = int(_cfg_get(cfg, "scale", default=dcfg.get("scale", 4)))
-    hsi_c = int(_cfg_get(cfg, "hsi_channels", default=dcfg.get("hsi_channels", 103)))
-    msi_c = int(_cfg_get(cfg, "msi_channels", default=dcfg.get("msi_channels", 4)))
-    patch = int(_cfg_get(cfg, "patch_size", default=dcfg.get("patch_size", 32)))
-    kernel = int(_cfg_get(cfg, "kernel_size", default=7))
-    seed = int(_cfg_get(cfg, "seed", default=0))
-
-    split_mode = str(dcfg.get("split_mode", "synthetic")).lower()
-    if split_mode == "smooth_operator_v1":
-        protocol_root = resolve_path(
-            root, dcfg.get("root", "data/protocol_reboot/paviau/smooth_operator_v1")
+def build_datasets(
+    config: dict[str, Any],
+) -> tuple[BaselineExportDataset, BaselineExportDataset, Path, str]:
+    data_config = config.get("data", {}) or {}
+    split_mode = str(data_config.get("split_mode", "baseline_export")).lower()
+    if split_mode != "baseline_export":
+        raise ValueError(
+            "This public training script supports only "
+            f"data.split_mode: baseline_export, but got {split_mode!r}."
         )
-        eval_crop_policy = normalize_eval_crop_policy(dcfg.get("eval_crop_policy"))
-        train_set = SmoothOperatorTrainDataset(protocol_root)
-        val_set = SmoothOperatorValDataset(
-            protocol_root, "clean", eval_crop_policy=eval_crop_policy
-        )
-        return train_set, val_set, split_mode, str(protocol_root), eval_crop_policy
+    if "root" not in data_config:
+        raise KeyError("Missing data.root in the config")
 
-    if split_mode == "mismatch_mixed":
-        clean_root = resolve_path(root, dcfg.get("clean_root", dcfg.get("root", "data/baseline_export/paviau")))
-        eval_crop_policy = normalize_eval_crop_policy(dcfg.get("eval_crop_policy"))
-        train_set = MismatchMixedTrainDataset(clean_root)
-        val_set = BaselineExportDataset(clean_root, split="val", eval_crop_policy=eval_crop_policy)
-        return train_set, val_set, split_mode, str(clean_root), eval_crop_policy
-
-    if split_mode == "synthetic" or "train_samples" in cfg:
-        n_train = int(_cfg_get(cfg, "train_samples", default=64))
-        n_val = int(_cfg_get(cfg, "val_samples", default=8))
-        train_set = SyntheticHSIMSIFusionDataset(
-            num_samples=n_train,
-            hsi_channels=hsi_c,
-            msi_channels=msi_c,
-            patch_size=patch,
-            scale=scale,
-            kernel_size=kernel,
-            seed=seed,
-            semi_blind=True,
-        )
-        val_set = SyntheticHSIMSIFusionDataset(
-            num_samples=n_val,
-            hsi_channels=hsi_c,
-            msi_channels=msi_c,
-            patch_size=patch,
-            scale=scale,
-            kernel_size=kernel,
-            seed=seed + 10_000,
-            semi_blind=True,
-        )
-        return train_set, val_set, "synthetic", "synthetic (on-the-fly)", "N/A"
-
-    data_root = resolve_path(root, dcfg.get("root", "data/baseline_export/paviau"))
-    split_mode = str(dcfg.get("split_mode", "baseline_export"))
-    eval_crop_policy = normalize_eval_crop_policy(dcfg.get("eval_crop_policy"))
-    train_set = BaselineExportDataset(data_root, split="train", eval_crop_policy=eval_crop_policy)
-    val_set = BaselineExportDataset(data_root, split="val", eval_crop_policy=eval_crop_policy)
-    return train_set, val_set, split_mode, str(data_root), eval_crop_policy
+    data_root = resolve_path(ROOT, data_config["root"])
+    crop_policy = normalize_eval_crop_policy(data_config.get("eval_crop_policy"))
+    train_set = BaselineExportDataset(
+        data_root,
+        split="train",
+        eval_crop_policy=crop_policy,
+    )
+    val_set = BaselineExportDataset(
+        data_root,
+        split="val",
+        eval_crop_policy=crop_policy,
+    )
+    return train_set, val_set, data_root, crop_policy
 
 
-def _is_b10_config(cfg: dict[str, Any]) -> bool:
-    return str(cfg.get("model", "DCSRNet")) == "DCSROperatorHypothesisNet"
-
-
-def _build_loss(cfg: dict[str, Any], scale: int) -> nn.Module:
-    if _is_b10_config(cfg):
-        from utils.b10_losses import B10OperatorHypothesisLoss
-
-        lcfg = cfg.get("loss", cfg)
-        return B10OperatorHypothesisLoss(
-            scale=scale,
-            lambda_rec=float(_cfg_get(lcfg, "lambda_rec", default=1.0)),
-            lambda_sam=float(_cfg_get(lcfg, "lambda_sam", default=0.05)),
-            lambda_init=float(_cfg_get(lcfg, "lambda_init", default=0.2)),
-            lambda_obs=float(_cfg_get(lcfg, "lambda_obs", default=0.1)),
-            lambda_diag=float(_cfg_get(lcfg, "lambda_diag", default=0.1)),
-        )
-    lcfg = cfg.get("loss", cfg)
+def build_loss(config: dict[str, Any], scale: int) -> DCSRLoss:
+    loss_config = config.get("loss", {}) or {}
     return DCSRLoss(
         scale=scale,
-        lambda_rec=float(_cfg_get(lcfg, "lambda_rec", default=1.0)),
-        lambda_rec_coarse=float(_cfg_get(lcfg, "lambda_rec_coarse", default=0.0)),
-        lambda_obs=float(_cfg_get(lcfg, "lambda_obs", default=0.2)),
-        lambda_obs_coarse=float(_cfg_get(lcfg, "lambda_obs_coarse", default=0.1)),
-        lambda_sam=float(_cfg_get(lcfg, "lambda_sam", default=0.05)),
-        lambda_deg=float(_cfg_get(lcfg, "lambda_deg", default=0.001)),
-        lambda_sel=float(_cfg_get(lcfg, "lambda_sel", default=0.0001)),
+        lambda_rec=float(loss_config.get("lambda_rec", 1.0)),
+        lambda_rec_coarse=float(loss_config.get("lambda_rec_coarse", 0.0)),
+        lambda_obs=float(loss_config.get("lambda_obs", 0.2)),
+        lambda_obs_coarse=float(loss_config.get("lambda_obs_coarse", 0.1)),
+        lambda_sam=float(loss_config.get("lambda_sam", 0.05)),
+        lambda_deg=float(loss_config.get("lambda_deg", 0.001)),
+        lambda_sel=float(loss_config.get("lambda_sel", 0.0001)),
         lambda_feedback_intermediate=float(
-            _cfg_get(lcfg, "lambda_feedback_intermediate", default=0.0)
+            loss_config.get("lambda_feedback_intermediate", 0.0)
         ),
     )
 
 
-def _build_config_rows(
+def make_loaders(
+    train_set: BaselineExportDataset,
+    val_set: BaselineExportDataset,
     *,
-    cfg: dict[str, Any],
-    model: nn.Module,
-    train_set: Any,
-    val_set: Any,
-    split_mode: str,
-    data_root: str,
-    run_dir: Path,
-    device: torch.device,
-    epochs: int,
     batch_size: int,
+    val_batch_size: int,
     num_workers: int,
-    lr: float,
-    weight_decay: float,
-    amp: bool,
-    eval_crop_policy: str,
-    val_eval_shape: str,
-) -> list[tuple[str, str]]:
-    dcfg = cfg.get("data", {})
-    marg = cfg.get("model_args", {})
-    pcounts = count_parameters(model)
-    dataset_name = _na(dcfg.get("dataset", dcfg.get("name", "synthetic" if split_mode == "synthetic" else None)))
-
-    rows: list[tuple[str, str]] = [
-        ("task", _na(cfg.get("task"))),
-        ("setting", _na(cfg.get("setting"))),
-        ("model", _na(cfg.get("model", "DCSRNet"))),
-        ("dataset", dataset_name),
-        ("data_root", data_root),
-        ("save_dir", str(run_dir)),
-        ("split_mode", split_mode),
-        ("eval_crop_policy", eval_crop_policy),
-        ("validation_eval_shape", val_eval_shape),
-        ("epochs", str(epochs)),
-        ("batch_size", str(batch_size)),
-        ("num_workers", str(num_workers)),
-        ("lr", f"{lr:.2e}"),
-        ("weight_decay", f"{weight_decay:.2e}"),
-        ("amp", str(amp)),
-        ("device", str(device)),
-        ("hsi_channels", _na(_cfg_get(cfg, "hsi_channels", default=dcfg.get("hsi_channels")))),
-        ("msi_channels", _na(_cfg_get(cfg, "msi_channels", default=dcfg.get("msi_channels")))),
-        ("scale", _na(_cfg_get(cfg, "scale", default=dcfg.get("scale")))),
-        ("patch_size", _na(_cfg_get(cfg, "patch_size", default=dcfg.get("patch_size")))),
-        ("num_train_patches", _na(dcfg.get("num_train_patches"))),
-        ("train_samples", _na(_cfg_get(cfg, "train_samples", default=len(train_set)))),
-        ("val_samples", _na(_cfg_get(cfg, "val_samples", default=len(val_set)))),
-        ("kernel_size", _na(marg.get("kernel_size", _cfg_get(cfg, "kernel_size")))),
-        ("base_channels", _na(marg.get("base_channels", _cfg_get(cfg, "base_channels")))),
-        (
-            "delta_phi_scale",
-            _na(
-                marg.get(
-                    "delta_phi_scale",
-                    _cfg_get(cfg, "delta_phi_scale", default=getattr(model, "delta_phi_scale", None)),
-                )
-            ),
-        ),
-        ("delta_k_scale", _na(marg.get("delta_k_scale", getattr(model, "delta_k_scale", None)))),
-        ("guidance_channels", _na(marg.get("guidance_channels"))),
-        ("use_signed_residual_guidance", _na(marg.get("use_signed_residual_guidance"))),
-        ("use_msi_detail_guidance", _na(marg.get("use_msi_detail_guidance"))),
-        ("params_total", f"{pcounts['total']} ({format_num_params(pcounts['total'])})"),
-        ("params_trainable", f"{pcounts['trainable']} ({format_num_params(pcounts['trainable'])})"),
-        ("params_frozen", f"{pcounts['frozen']} ({format_num_params(pcounts['frozen'])})"),
-    ]
-    return rows
-
-
-def _apply_resume(
-    resume_path: Path,
-    *,
-    run_dir: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.StepLR,
     device: torch.device,
-    dual: TrainingDualLogger,
-    ckpt_mgr: CheckpointManager,
-    scaler: Any | None = None,
-) -> tuple[int, int, bool, bool, bool]:
-    """Load checkpoint; return (start_epoch, loaded_epoch, opt_ok, sched_ok, scaler_ok)."""
-    if not resume_path.is_file():
-        raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+) -> tuple[DataLoader, DataLoader]:
+    if min(batch_size, val_batch_size) < 1:
+        raise ValueError("Batch sizes must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
 
-    ckpt_dir = resume_path.resolve().parent
-    if ckpt_dir != run_dir.resolve():
-        dual.log_both_plain(
-            f"WARNING: resume checkpoint dir {ckpt_dir} != config save_dir {run_dir.resolve()} "
-            "(using config save_dir for outputs)"
-        )
-
-    payload = torch.load(str(resume_path), map_location=device, weights_only=False)
-    if not isinstance(payload, dict) or "model" not in payload:
-        raise ValueError(f"resume checkpoint must be a dict with 'model' key: {resume_path}")
-
-    model.load_state_dict(payload["model"], strict=True)
-
-    opt_ok = False
-    if isinstance(payload.get("optimizer"), dict):
-        optimizer.load_state_dict(payload["optimizer"])
-        opt_ok = True
-
-    sched_ok = False
-    if isinstance(payload.get("scheduler"), dict):
-        scheduler.load_state_dict(payload["scheduler"])
-        sched_ok = True
-
-    scaler_ok = False
-    if scaler is not None and isinstance(payload.get("scaler"), dict):
-        scaler.load_state_dict(payload["scaler"])
-        scaler_ok = True
-
-    loaded_epoch = int(payload.get("epoch", -1))
-    if loaded_epoch < 0:
-        raise ValueError(f"resume checkpoint missing valid 'epoch': {resume_path}")
-    start_epoch = loaded_epoch + 1
-
-    meta_ok = ckpt_mgr.restore_from_meta()
-    if not meta_ok:
-        dual.log_both_plain(
-            "WARNING: could not restore best-metric tracker from robust_ckpt_selection_meta.json; "
-            "existing best_psnr.pth / best_sam.pth / best_ergas.pth are kept unchanged"
-        )
-
-    dual.log_both_plain(f"[Resume] path={resume_path}")
-    dual.log_both_plain(f"[Resume] loaded_epoch={loaded_epoch}")
-    dual.log_both_plain(f"[Resume] start_epoch={start_epoch}")
-    dual.log_both_plain(f"[Resume] optimizer_restored={opt_ok}")
-    dual.log_both_plain(f"[Resume] scheduler_restored={sched_ok}")
-    dual.log_both_plain(f"[Resume] scaler_restored={scaler_ok}")
-    if meta_ok:
-        dual.log_both_plain(
-            f"[Resume] best_tracker_restored=True "
-            f"(psnr={ckpt_mgr.best_psnr:.4f}@{ckpt_mgr.best_psnr_epoch:03d})"
-        )
-    else:
-        dual.log_both_plain("[Resume] best_tracker_restored=False")
-
-    return start_epoch, loaded_epoch, opt_ok, sched_ok, scaler_ok
-
-
-def _train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: DCSRLoss,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    *,
-    epoch: int,
-    epochs: int,
-) -> tuple[float, dict[str, float]]:
-    model.train()
-    total_loss = 0.0
-    n = 0
-    comp_sums: dict[str, float] = {}
-    lr_now = get_optimizer_lr(optimizer)
-
-    pbar = tqdm(
-        loader,
-        desc=f"[Train E{epoch:03d}/{epochs:03d}]",
-        leave=False,
-        dynamic_ncols=True,
-        unit="batch",
-    )
-    for batch in pbar:
-        batch = _to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-        pred = model(batch)
-        loss_dict = criterion(pred, batch)
-        loss = loss_dict["loss"]
-        if not isinstance(loss, torch.Tensor):
-            raise TypeError("DCSRLoss must return tensor 'loss'")
-        loss.backward()
-        optimizer.step()
-
-        bs = batch["h"].shape[0]
-        lv = float(loss.item())
-        total_loss += lv * bs
-        n += bs
-        for k in (
-            "loss_rec",
-            "loss_rec_coarse",
-            "loss_init",
-            "loss_obs",
-            "loss_obs_coarse",
-            "loss_sam",
-            "loss_feedback_intermediate",
-            "loss_diag",
-            "loss_deg",
-            "loss_sel",
-        ):
-            if k in loss_dict:
-                comp_sums[k] = comp_sums.get(k, 0.0) + float(loss_dict[k]) * bs
-
-        postfix: dict[str, str] = {
-            "loss": f"{lv:.2e}",
-            "lr": f"{lr_now:.1e}",
-            "mem": f"{gpu_memory_gb():.2f}G",
-        }
-        if "loss_rec" in loss_dict:
-            postfix["rec"] = f"{float(loss_dict['loss_rec']):.2e}"
-        if "loss_obs" in loss_dict:
-            postfix["obs"] = f"{float(loss_dict['loss_obs']):.2e}"
-        pbar.set_postfix(postfix, refresh=True)
-
-    inv = max(1, n)
-    return total_loss / inv, {k: v / inv for k, v in comp_sums.items()}
-
-
-@torch.no_grad()
-def _evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: DCSRLoss,
-    device: torch.device,
-    scale: int,
-    *,
-    epoch: int,
-    epochs: int,
-) -> tuple[float, dict[str, float], dict[str, torch.Tensor] | None, dict[str, Any] | None]:
-    model.eval()
-    total_loss = 0.0
-    n = 0
-    psnr_sum = psnr_coarse_sum = sam_sum = rmse_sum = ergas_sum = ssim_sum = 0.0
-    m_count = 0
-    last_pred: dict[str, torch.Tensor] | None = None
-    last_batch: dict[str, Any] | None = None
-
-    pbar = tqdm(
-        loader,
-        desc=f"[Val   E{epoch:03d}/{epochs:03d}]",
-        leave=False,
-        dynamic_ncols=True,
-        unit="batch",
-    )
-    for batch in pbar:
-        batch = _to_device(batch, device)
-        pred = model(batch)
-        loss_dict = criterion(pred, batch)
-        loss = loss_dict["loss"]
-        bs = batch["h"].shape[0]
-        total_loss += float(loss.item()) * bs
-        n += bs
-        if "gt" in batch:
-            z = pred["z_hat"]
-            gt = batch["gt"]
-            psnr_sum += psnr(z, gt)
-            if "z_coarse" in pred:
-                psnr_coarse_sum += psnr(pred["z_coarse"], gt)
-            elif "z0" in pred:
-                psnr_coarse_sum += psnr(pred["z0"], gt)
-            sam_sum += sam(z, gt)
-            rmse_sum += rmse(z, gt)
-            ergas_sum += ergas(z, gt, scale=scale)
-            ssim_sum += ssim(z, gt)
-            m_count += 1
-        last_pred = pred
-        last_batch = batch
-
-        nb = max(1, m_count)
-        postfix = {
-            "PSNR": f"{psnr_sum / nb:.2f}",
-            "SAM": f"{sam_sum / nb:.2f}",
-            "RMSE": f"{rmse_sum / nb:.4f}",
-            "ERGAS": f"{ergas_sum / nb:.2f}",
-        }
-        if m_count > 0:
-            postfix["SSIM"] = f"{ssim_sum / nb:.4f}"
-        pbar.set_postfix(postfix, refresh=True)
-
-    vp = psnr_sum / max(1, m_count)
-    vpc = psnr_coarse_sum / max(1, m_count)
-    metrics = {
-        "val_psnr": vp,
-        "val_psnr_coarse": vpc,
-        "psnr_gap": vp - vpc if m_count > 0 else float("nan"),
-        "val_sam": sam_sum / max(1, m_count),
-        "val_rmse": rmse_sum / max(1, m_count),
-        "val_ergas": ergas_sum / max(1, m_count),
-        "val_ssim": ssim_sum / max(1, m_count),
-        "has_gt": m_count > 0,
+    common = {
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": num_workers > 0,
+        "collate_fn": collate_fusion,
     }
-    return total_loss / max(1, n), metrics, last_pred, last_batch
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train DCSR-Net")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
-    parser.add_argument("--data-root", type=str, default=None, help="Override data.root in config")
-    parser.add_argument("--device", type=str, default=None, help="cuda | cpu (default: auto)")
-    parser.add_argument("--overwrite", action="store_true", help="Replace existing run_dir contents")
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint (.pth) to resume; continues from epoch+1 in the same save_dir",
-    )
-    args = parser.parse_args()
-
-    cfg_path = resolve_path(ROOT, args.config)
-    with cfg_path.open(encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    if args.data_root:
-        cfg.setdefault("data", {})["root"] = args.data_root
-
-    seed = int(_cfg_get(cfg, "seed", default=0))
-    set_seed(seed)
-
-    device_str = args.device or str(_cfg_get(cfg, "device", default="cuda"))
-    if device_str == "cuda" and not torch.cuda.is_available():
-        device_str = "cpu"
-    device = torch.device(device_str)
-
-    tcfg = cfg.get("train", cfg)
-    dcfg = cfg.get("data", {})
-    marg = cfg.get("model_args", {})
-    scale = int(_cfg_get(cfg, "scale", default=dcfg.get("scale", marg.get("scale", 4))))
-    hsi_c = int(_cfg_get(cfg, "hsi_channels", default=dcfg.get("hsi_channels", marg.get("hsi_channels", 103))))
-    msi_c = int(_cfg_get(cfg, "msi_channels", default=dcfg.get("msi_channels", marg.get("msi_channels", 4))))
-    kernel = int(_cfg_get(cfg, "kernel_size", default=marg.get("kernel_size", 7)))
-    base_ch = int(_cfg_get(cfg, "base_channels", default=marg.get("base_channels", 64)))
-    delta_phi = float(marg.get("delta_phi_scale", _cfg_get(cfg, "delta_phi_scale", default=0.05)))
-
-    train_set, val_set, split_mode, data_root, eval_crop_policy = _build_datasets(cfg, ROOT)
-    val_eval_shape = _validation_eval_shape(val_set)
-    batch_size = int(tcfg.get("batch_size", _cfg_get(cfg, "batch_size", default=2)))
-    num_workers = int(tcfg.get("num_workers", _cfg_get(cfg, "num_workers", default=0)))
-    epochs = int(tcfg.get("epochs", _cfg_get(cfg, "epochs", default=5)))
-    lr = float(tcfg.get("lr", _cfg_get(cfg, "lr", default=1e-4)))
-    wd = float(tcfg.get("weight_decay", _cfg_get(cfg, "weight_decay", default=0.0)))
-    save_dir = str(tcfg.get("save_dir", _cfg_get(cfg, "save_dir", default="outputs/debug_run")))
-    amp = bool(tcfg.get("amp", _cfg_get(cfg, "amp", default=False)))
-    resume_path: Path | None = None
-    if args.resume:
-        resume_path = resolve_path(ROOT, args.resume)
-    overwrite = bool(args.overwrite) or bool(tcfg.get("overwrite", _cfg_get(cfg, "overwrite", default=False)))
-    if resume_path is not None and overwrite:
-        print("warning: --overwrite ignored when --resume is set")
-        overwrite = False
-
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        collate_fn=_collate_fusion,
+        drop_last=False,
+        **common,
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=int(tcfg.get("val_batch_size", batch_size)),
+        batch_size=val_batch_size,
         shuffle=False,
+        drop_last=False,
+        **common,
+    )
+    return train_loader, val_loader
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: DCSRLoss,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    device: torch.device,
+    *,
+    epoch: int,
+    epochs: int,
+    amp_enabled: bool,
+) -> tuple[float, dict[str, float]]:
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+    component_sums = {key: 0.0 for key in LOSS_KEYS}
+
+    progress = tqdm(
+        loader,
+        desc=f"Train {epoch:03d}/{epochs:03d}",
+        leave=False,
+        dynamic_ncols=True,
+        unit="batch",
+    )
+    for batch in progress:
+        batch = move_to_device(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            prediction = model(batch)
+            loss_dict = criterion(prediction, batch)
+            loss = loss_dict["loss"]
+
+        if not isinstance(loss, torch.Tensor):
+            raise TypeError("DCSRLoss must return a tensor named 'loss'")
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite loss at epoch {epoch}: {float(loss.detach().item())}"
+            )
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        current_batch_size = int(batch["h"].shape[0])
+        loss_value = float(loss.detach().item())
+        total_loss += loss_value * current_batch_size
+        total_samples += current_batch_size
+
+        for key in LOSS_KEYS:
+            if key in loss_dict:
+                component_sums[key] += float(loss_dict[key]) * current_batch_size
+
+        progress.set_postfix(
+            loss=f"{loss_value:.3e}",
+            rec=f"{float(loss_dict.get('loss_rec', math.nan)):.3e}",
+            obs=f"{float(loss_dict.get('loss_obs', math.nan)):.3e}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            refresh=False,
+        )
+
+    denominator = max(1, total_samples)
+    components = {key: value / denominator for key, value in component_sums.items()}
+    return total_loss / denominator, components
+
+
+@torch.no_grad()
+def validate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: DCSRLoss,
+    device: torch.device,
+    *,
+    scale: int,
+    epoch: int,
+    epochs: int,
+    amp_enabled: bool,
+) -> tuple[float, dict[str, float]]:
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    metric_batches = 0
+    coarse_batches = 0
+    sums = {
+        "psnr": 0.0,
+        "ssim": 0.0,
+        "sam": 0.0,
+        "rmse": 0.0,
+        "ergas": 0.0,
+        "psnr_coarse": 0.0,
+    }
+
+    progress = tqdm(
+        loader,
+        desc=f"Val   {epoch:03d}/{epochs:03d}",
+        leave=False,
+        dynamic_ncols=True,
+        unit="batch",
+    )
+    for batch in progress:
+        batch = move_to_device(batch, device)
+
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            prediction = model(batch)
+            loss_dict = criterion(prediction, batch)
+            loss = loss_dict["loss"]
+
+        current_batch_size = int(batch["h"].shape[0])
+        total_loss += float(loss.detach().item()) * current_batch_size
+        total_samples += current_batch_size
+
+        reconstruction = prediction["z_hat"].float()
+        target = batch["gt"].float()
+        sums["psnr"] += psnr(reconstruction, target)
+        sums["ssim"] += ssim(reconstruction, target)
+        sums["sam"] += sam(reconstruction, target)
+        sums["rmse"] += rmse(reconstruction, target)
+        sums["ergas"] += ergas(reconstruction, target, scale=scale)
+        metric_batches += 1
+
+        coarse = prediction.get("z_coarse", prediction.get("z0"))
+        if isinstance(coarse, torch.Tensor):
+            sums["psnr_coarse"] += psnr(coarse.float(), target)
+            coarse_batches += 1
+
+        progress.set_postfix(
+            PSNR=f"{sums['psnr'] / metric_batches:.2f}",
+            SSIM=f"{sums['ssim'] / metric_batches:.4f}",
+            SAM=f"{sums['sam'] / metric_batches:.2f}",
+            refresh=False,
+        )
+
+    if metric_batches == 0:
+        raise RuntimeError("The validation loader produced no batches")
+
+    metrics = {
+        "psnr": sums["psnr"] / metric_batches,
+        "ssim": sums["ssim"] / metric_batches,
+        "sam": sums["sam"] / metric_batches,
+        "rmse": sums["rmse"] / metric_batches,
+        "ergas": sums["ergas"] / metric_batches,
+        "psnr_coarse": (
+            sums["psnr_coarse"] / coarse_batches
+            if coarse_batches > 0
+            else float("nan")
+        ),
+    }
+    metrics["psnr_gain"] = (
+        metrics["psnr"] - metrics["psnr_coarse"]
+        if math.isfinite(metrics["psnr_coarse"])
+        else float("nan")
+    )
+    return total_loss / max(1, total_samples), metrics
+
+
+def save_checkpoint(payload: dict[str, Any], path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def load_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.cuda.amp.GradScaler,
+    device: torch.device,
+    best_path: Path,
+) -> tuple[int, float, int]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or "model" not in payload:
+        raise ValueError(f"Invalid checkpoint: {path}")
+
+    model.load_state_dict(payload["model"], strict=True)
+    if isinstance(payload.get("optimizer"), dict):
+        optimizer.load_state_dict(payload["optimizer"])
+    if isinstance(payload.get("scheduler"), dict):
+        scheduler.load_state_dict(payload["scheduler"])
+    if scaler.is_enabled() and isinstance(payload.get("scaler"), dict):
+        scaler.load_state_dict(payload["scaler"])
+
+    epoch = int(payload.get("epoch", -1))
+    if epoch < 0:
+        raise ValueError(f"Checkpoint has no valid epoch: {path}")
+
+    best_psnr = float(payload.get("best_psnr", -math.inf))
+    best_epoch = int(payload.get("best_psnr_epoch", -1))
+    if not math.isfinite(best_psnr) and best_path.is_file():
+        best_payload = torch.load(best_path, map_location=device, weights_only=False)
+        if isinstance(best_payload, dict):
+            best_metrics = best_payload.get("metrics", {})
+            if isinstance(best_metrics, dict):
+                restored = best_metrics.get("psnr", best_metrics.get("val_psnr"))
+                if restored is not None:
+                    best_psnr = float(restored)
+                    best_epoch = int(best_payload.get("epoch", -1))
+
+    if not math.isfinite(best_psnr):
+        metrics = payload.get("metrics", {})
+        if isinstance(metrics, dict):
+            current = metrics.get("psnr", metrics.get("val_psnr"))
+            if current is not None:
+                best_psnr = float(current)
+                best_epoch = epoch
+
+    return epoch + 1, best_psnr, best_epoch
+
+
+def make_checkpoint(
+    *,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.cuda.amp.GradScaler,
+    config: dict[str, Any],
+    metrics: dict[str, float],
+    best_psnr: float,
+    best_psnr_epoch: int,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "config": copy.deepcopy(config),
+        "metrics": metrics,
+        "best_psnr": best_psnr,
+        "best_psnr_epoch": best_psnr_epoch,
+    }
+    if scaler.is_enabled():
+        payload["scaler"] = scaler.state_dict()
+    return payload
+
+
+def append_metrics(path: Path, row: dict[str, Any]) -> None:
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+
+def finite_text(value: Any, digits: int = 6) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:.{digits}f}" if math.isfinite(number) else ""
+
+
+def log(message: str, file: Any) -> None:
+    print(message, flush=True)
+    file.write(message + "\n")
+    file.flush()
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = resolve_path(ROOT, args.config)
+    config = load_config(config_path)
+
+    if args.data_root is not None:
+        config.setdefault("data", {})["root"] = args.data_root
+
+    train_config = config.get("train", {}) or {}
+    data_config = config.get("data", {}) or {}
+    model_config = config.get("model_args", {}) or {}
+
+    seed = int(config.get("seed", 42))
+    set_seed(seed)
+
+    device_name = str(args.device or config.get("device", "cuda"))
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA is unavailable; using CPU instead.", flush=True)
+        device_name = "cpu"
+    device = torch.device(device_name)
+
+    scale = int(
+        config.get(
+            "scale",
+            data_config.get("scale", model_config.get("scale", 4)),
+        )
+    )
+    epochs = int(train_config.get("epochs", 400))
+    batch_size = int(train_config.get("batch_size", 8))
+    val_batch_size = int(train_config.get("val_batch_size", batch_size))
+    num_workers = int(train_config.get("num_workers", 4))
+    learning_rate = float(train_config.get("lr", 2e-4))
+    weight_decay = float(train_config.get("weight_decay", 1e-6))
+    eval_every = int(train_config.get("eval_every", 1))
+    amp_requested = bool(train_config.get("amp", False))
+    amp_enabled = amp_requested and device.type == "cuda"
+
+    if epochs < 1 or eval_every < 1:
+        raise ValueError("train.epochs and train.eval_every must be positive")
+
+    run_dir = resolve_path(
+        ROOT,
+        train_config.get("save_dir", "outputs/runs/dcrf_net"),
+    )
+    resume_path = resolve_path(ROOT, args.resume) if args.resume else None
+    overwrite = bool(args.overwrite or train_config.get("overwrite", False))
+    if resume_path is not None:
+        overwrite = False
+    prepare_run_dir(run_dir, overwrite=overwrite, resume=resume_path is not None)
+
+    train_set, val_set, data_root, crop_policy = build_datasets(config)
+    train_loader, val_loader = make_loaders(
+        train_set,
+        val_set,
+        batch_size=batch_size,
+        val_batch_size=val_batch_size,
         num_workers=num_workers,
-        collate_fn=_collate_fusion,
+        device=device,
     )
 
-    if _is_b10_config(cfg) and bool(dcfg.get("protocol_validate", True)):
-        from tools.validate_smooth_operator_protocol import run_validation
-
-        proto_root = resolve_path(
-            ROOT, dcfg.get("root", "data/protocol_reboot/paviau/smooth_operator_v1")
-        )
-        if not run_validation(proto_root, skip_export_check=False):
-            raise SystemExit("smooth_operator_v1 protocol validation failed; training aborted")
-
-    model = build_model_from_config(cfg, device, enforce_nonblind=not _is_b10_config(cfg))
-
-    criterion = _build_loss(cfg, scale)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    model = build_model_from_config(config, device=device, enforce_nonblind=True)
+    criterion = build_loss(config, scale).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
-        step_size=int(tcfg.get("lr_step", 50)),
-        gamma=float(tcfg.get("lr_gamma", 0.5)),
+        step_size=int(train_config.get("lr_step", 50)),
+        gamma=float(train_config.get("lr_gamma", 0.5)),
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
-    run_dir = create_run_dir(resolve_path(ROOT, save_dir), overwrite=overwrite)
-    if resume_path is None:
-        save_config_snapshot(cfg, run_dir)
-    save_args_snapshot({"config": str(cfg_path), **vars(args)}, run_dir)
-
-    dual = TrainingDualLogger(run_dir)
-    dual.setup(append=resume_path is not None)
-
-    metrics_logger = CSVLogger(run_dir / "train_valid_metrics.csv", fieldnames=TRAIN_VALID_METRICS_FIELDS)
-    ckpt_mgr = CheckpointManager(run_dir, primary_metric="psnr", save_latest=True)
-
+    latest_path = run_dir / "latest.pth"
+    best_path = run_dir / "best_psnr.pth"
+    metrics_path = run_dir / "train_valid_metrics.csv"
     start_epoch = 1
+    best_psnr = -math.inf
+    best_psnr_epoch = -1
+
     if resume_path is not None:
-        start_epoch, _, _, _, _ = _apply_resume(
+        start_epoch, best_psnr, best_psnr_epoch = load_checkpoint(
             resume_path,
-            run_dir=run_dir,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
+            scaler=scaler,
             device=device,
-            dual=dual,
-            ckpt_mgr=ckpt_mgr,
-            scaler=None,
+            best_path=best_path,
         )
-        dual.log_system_file_only("phase=training_main boundary=after_resume")
-    else:
-        dual.emit_config_box_top()
-        for key, value in _build_config_rows(
-            cfg=cfg,
-            model=model,
-            train_set=train_set,
-            val_set=val_set,
-            split_mode=split_mode,
-            data_root=data_root,
-            run_dir=run_dir,
-            device=device,
-            epochs=epochs,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            lr=lr,
-            weight_decay=wd,
-            amp=amp,
-            eval_crop_policy=eval_crop_policy,
-            val_eval_shape=val_eval_shape,
-        ):
-            dual.emit_config_line(key, value)
-        dual.emit_config_box_bottom()
-        if isinstance(model, DCSRNet):
-            eff_snap = save_effective_config(run_dir, cfg, model)
-            log_effective_config(cfg, model, emit=dual.log_plain_file)
-        else:
-            eff_snap = {"model_variant": model_variant_label(cfg), "model": str(cfg.get("model"))}
-            dual.log_plain_file(f"model_variant: {eff_snap['model_variant']}")
-        dual.log_plain_file(f"effective_config.json -> {run_dir / 'effective_config.json'}")
-        if not eff_snap.get("strict_nonblind_scales_match", True):
-            dual.log_plain_file(
-                "WARNING: declared delta_phi_scale/delta_k_scale do not match effective model attributes"
+        if resume_path.resolve().parent != run_dir.resolve():
+            print(
+                f"Warning: checkpoint is in {resume_path.parent}, "
+                f"but outputs will be saved to {run_dir}.",
+                flush=True,
             )
-        dual.log_plain_file(f"eval_crop_policy={eval_crop_policy} ({eval_crop_policy_description(eval_crop_policy)})")
-        dual.log_plain_file(f"validation_eval_shape={val_eval_shape}")
-        if eval_crop_policy == "top_left":
-            dual.log_plain_file("formal evaluation crop policy aligned with Table III: top_left")
-        else:
-            dual.log_plain_file(
-                "formal evaluation crop policy: center (legacy; not aligned with Table III top_left common-eval)"
-            )
-        dual.log_system_file_only("phase=training_main boundary=after_config")
 
-    mismatch_val_roots = dcfg.get("mismatch_val_roots")
-    b10_eval_cfg = cfg.get("b10_eval", {}) or {}
-    smoke_best_tracker: dict[str, Any] = {}
-    b10_best_tracker: dict[str, Any] = {}
-    metrics_by_setting_path = run_dir / "metrics_by_setting.csv"
-    is_b10 = _is_b10_config(cfg)
-    if is_b10:
-        from utils.b10_protocol_eval import evaluate_all_b10_settings, step_b10_checkpoints, write_metrics_by_setting_csv
-        from utils.smooth_operator_protocol import VAL_SETTINGS
+    with (run_dir / "config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, sort_keys=False, allow_unicode=True)
+    with (run_dir / "args.json").open("w", encoding="utf-8") as file:
+        json.dump(vars(args), file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    save_effective_config(run_dir, config, model)
 
-        b10_settings = list(b10_eval_cfg.get("settings", VAL_SETTINGS))
-        dual.log_plain_file(f"B10 protocol eval settings: {b10_settings}")
-        dual.log_plain_file(
-            "B10 checkpoints: best_clean_psnr, best_mean_heldout_psnr, "
-            "best_worst_heldout_psnr, best_joint_heldout_psnr"
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+
+    log_mode = "a" if resume_path is not None else "w"
+    with (run_dir / "train.log").open(log_mode, encoding="utf-8") as log_file:
+        log("=" * 72, log_file)
+        log("DCRF-Net training", log_file)
+        log(f"Config: {config_path}", log_file)
+        log(f"Data root: {data_root}", log_file)
+        log(
+            f"Evaluation crop: {crop_policy} "
+            f"({eval_crop_policy_description(crop_policy)})",
+            log_file,
         )
-    if mismatch_val_roots and isinstance(mismatch_val_roots, dict):
-        from utils.b9_smoke_eval import (
-            evaluate_all_settings,
-            step_smoke_best_checkpoints,
-            write_metrics_by_setting_csv,
+        log(f"Output: {run_dir}", log_file)
+        log(f"Device: {device}", log_file)
+        log(f"Seed: {seed}", log_file)
+        log(f"Training samples: {len(train_set)}", log_file)
+        log(f"Validation samples: {len(val_set)}", log_file)
+        log(
+            f"Parameters: {total_parameters:,} total, "
+            f"{trainable_parameters:,} trainable",
+            log_file,
         )
-
-        dual.log_plain_file(f"B9 mismatch_val_roots: {list(mismatch_val_roots.keys())}")
-        dual.log_plain_file(
-            "B9 smoke checkpoints: best_clean_psnr.pth, best_mean_psnr.pth, "
-            "best_worst_case_psnr.pth (best_psnr.pth = clean val_loader, compatibility only)"
+        log(
+            f"Epochs: {epochs}, batch size: {batch_size}, "
+            f"learning rate: {learning_rate:.3e}, AMP: {amp_enabled}",
+            log_file,
         )
+        if amp_requested and not amp_enabled:
+            log("AMP was requested but is disabled on the selected device.", log_file)
+        if resume_path is not None:
+            log(f"Resume: {resume_path}", log_file)
+            log(f"Start epoch: {start_epoch}", log_file)
+        log("=" * 72, log_file)
 
-    t_wall0 = time.perf_counter()
+        if start_epoch > epochs:
+            log("The checkpoint has already reached the configured epoch limit.", log_file)
+            return
 
-    for epoch in range(start_epoch, epochs + 1):
-        t_epoch0 = time.perf_counter()
-        train_loss, train_comps = _train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch=epoch, epochs=epochs
-        )
-        val_loss, val_metrics, last_pred, last_batch = _evaluate(
-            model, val_loader, criterion, device, scale, epoch=epoch, epochs=epochs
-        )
+        training_start = time.perf_counter()
+        for epoch in range(start_epoch, epochs + 1):
+            epoch_start = time.perf_counter()
+            current_lr = float(optimizer.param_groups[0]["lr"])
 
-        lr_now = get_optimizer_lr(optimizer)
-        mem_alloc = gpu_memory_gb()
-        mem_reserved = gpu_memory_reserved_gb()
-        epoch_wall = time.perf_counter() - t_epoch0
-        wall_cum = time.perf_counter() - t_wall0
-
-        vp = float(val_metrics["val_psnr"])
-        vs_deg = float(val_metrics["val_sam"])
-        vr = float(val_metrics["val_rmse"])
-        ve = float(val_metrics["val_ergas"])
-        vssim = float(val_metrics["val_ssim"]) if val_metrics["has_gt"] else float("nan")
-        sam_rad, sam_deg = sam_rad_deg_pair(vs_deg)
-
-        diag_aux: dict[str, Any] = {}
-        if last_pred is not None and last_batch is not None:
-            diag_aux = collect_dcsr_diagnostics(last_pred, last_batch)
-
-        payload = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "config": copy.deepcopy(cfg),
-            "metrics": {k: v for k, v in val_metrics.items() if k != "has_gt"},
-        }
-        updated = ckpt_mgr.step(epoch, payload, val_psnr=vp, val_sam_deg=sam_deg, val_ergas=ve)
-
-        csv_row: dict[str, Any] = {
-            "epoch": epoch,
-            "train_loss": _fmt_csv(train_loss),
-            "rec_loss": _fmt_csv(train_comps.get("loss_rec", float("nan"))),
-            "rec_coarse_loss": _fmt_csv(train_comps.get("loss_rec_coarse", float("nan"))),
-            "obs_loss": _fmt_csv(train_comps.get("loss_obs", float("nan"))),
-            "obs_coarse_loss": _fmt_csv(train_comps.get("loss_obs_coarse", float("nan"))),
-            "sam_loss": _fmt_csv(train_comps.get("loss_sam", float("nan"))),
-            "deg_loss": _fmt_csv(train_comps.get("loss_deg", float("nan"))),
-            "sel_loss": _fmt_csv(train_comps.get("loss_sel", float("nan"))),
-            "PSNR": _fmt_csv(vp),
-            "SSIM": _fmt_csv(vssim) if math.isfinite(vssim) else "NaN",
-            "SAM_rad": _fmt_csv(sam_rad),
-            "SAM_deg": _fmt_csv(sam_deg),
-            "RMSE": _fmt_csv(vr),
-            "ERGAS": _fmt_csv(ve),
-            "best_psnr": _fmt_csv(ckpt_mgr.best_psnr) if ckpt_mgr.best_psnr_epoch >= 0 else "NaN",
-            "best_psnr_epoch": ckpt_mgr.best_psnr_epoch if ckpt_mgr.best_psnr_epoch >= 0 else "",
-            "best_sam_deg": _fmt_csv(ckpt_mgr.best_sam_deg) if ckpt_mgr.best_sam_epoch >= 0 else "NaN",
-            "best_sam_epoch": ckpt_mgr.best_sam_epoch if ckpt_mgr.best_sam_epoch >= 0 else "",
-            "best_ergas": _fmt_csv(ckpt_mgr.best_ergas) if ckpt_mgr.best_ergas_epoch >= 0 else "NaN",
-            "best_ergas_epoch": ckpt_mgr.best_ergas_epoch if ckpt_mgr.best_ergas_epoch >= 0 else "",
-            "lr": f"{lr_now:.8e}",
-            "gpu_mem_allocated_gb": f"{mem_alloc:.4f}",
-            "gpu_mem_reserved_gb": f"{mem_reserved:.4f}",
-            "epoch_wall_time_sec": f"{epoch_wall:.3f}",
-            "psnr_z_coarse": _fmt_csv(float(val_metrics.get("val_psnr_coarse", float("nan")))),
-            "psnr_gap": _fmt_csv(float(val_metrics.get("psnr_gap", float("nan")))),
-        }
-        for k in TRAIN_VALID_METRICS_FIELDS:
-            if k in diag_aux:
-                csv_row[k] = _fmt_csv(float(diag_aux[k]))
-        metrics_logger.append(csv_row)
-
-        updated_names: list[str] = []
-        saved_files: list[str] = []
-        if updated["psnr"]:
-            updated_names.append("PSNR")
-            saved_files.append("best_psnr.pth")
-        if updated["sam"]:
-            updated_names.append("SAM")
-            saved_files.append("best_sam.pth")
-        if updated["ergas"]:
-            updated_names.append("ERGAS")
-            saved_files.append("best_ergas.pth")
-        dual.log_epoch_summary_line(
-            format_epoch_line(
+            train_loss, train_components = train_one_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                scaler,
+                device,
                 epoch=epoch,
                 epochs=epochs,
-                train_loss=train_loss,
-                psnr=vp,
-                ssim=vssim if val_metrics["has_gt"] else None,
-                sam_deg=sam_deg,
-                rmse=vr,
-                ergas=ve,
-                best_psnr=ckpt_mgr.best_psnr,
-                best_psnr_epoch=ckpt_mgr.best_psnr_epoch,
-                lr=lr_now,
-                mem_gb=mem_alloc,
-                wall_s=wall_cum,
-            )
-        )
-        if updated_names:
-            dual.log_best_update(epoch, updated_names, saved_files)
-
-        if is_b10:
-            from utils.b10_protocol_eval import (
-                evaluate_all_b10_settings,
-                step_b10_checkpoints,
-                write_metrics_by_setting_csv,
+                amp_enabled=amp_enabled,
             )
 
-            model.eval()
-            proto_root = resolve_path(ROOT, dcfg.get("root"))
-            setting_rows = evaluate_all_b10_settings(
-                model,
-                proto_root,
-                b10_settings,
-                eval_crop_policy=eval_crop_policy,
-                device=device,
-                scale=scale,
-            )
-            write_metrics_by_setting_csv(metrics_by_setting_path, epoch, setting_rows)
-            b10_best_tracker, b10_saved = step_b10_checkpoints(
-                b10_best_tracker, epoch, setting_rows, payload, run_dir
-            )
-            dual.log_plain_file(
-                "[b10_val E"
-                + f"{epoch:03d}] "
-                + " ".join(f"{r['Setting']}={r['PSNR']:.2f}" for r in setting_rows)
-            )
-            if b10_saved:
-                dual.log_plain_file(f"[b10_val E{epoch:03d}] saved: {', '.join(b10_saved)}")
-            (run_dir / "b10_best_tracker.json").write_text(
-                json.dumps(b10_best_tracker, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        elif mismatch_val_roots and isinstance(mismatch_val_roots, dict):
-            from utils.b9_smoke_eval import (
-                aggregate_setting_psnrs,
-                evaluate_all_settings,
-                step_smoke_best_checkpoints,
-                write_metrics_by_setting_csv,
-            )
+            should_validate = epoch % eval_every == 0 or epoch == epochs
+            val_loss = float("nan")
+            val_metrics: dict[str, float] = {}
+            improved = False
 
-            model.eval()
-            setting_rows = evaluate_all_settings(
-                model,
-                mismatch_val_roots,
-                eval_crop_policy=eval_crop_policy,
-                device=device,
-                scale=scale,
-                resolve_path_fn=resolve_path,
-                project_root=ROOT,
-            )
-            write_metrics_by_setting_csv(metrics_by_setting_path, epoch, setting_rows)
-            smoke_best_tracker, smoke_saved = step_smoke_best_checkpoints(
-                smoke_best_tracker, epoch, setting_rows, payload, run_dir
-            )
-            agg = aggregate_setting_psnrs(setting_rows, "PSNR")
-            dual.log_plain_file(
-                f"[mismatch_val E{epoch:03d}] mean_psnr={agg['mean_psnr']:.4f} "
-                f"worst_case_psnr={agg['worst_case_psnr']:.4f} "
-                + " ".join(f"{r['Setting']}={r['PSNR']:.2f}" for r in setting_rows)
-            )
-            if smoke_saved:
-                dual.log_plain_file(f"[mismatch_val E{epoch:03d}] saved smoke ckpt: {', '.join(smoke_saved)}")
-            (run_dir / "smoke_best_tracker.json").write_text(
-                json.dumps(smoke_best_tracker, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            if should_validate:
+                val_loss, val_metrics = validate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    scale=scale,
+                    epoch=epoch,
+                    epochs=epochs,
+                    amp_enabled=amp_enabled,
+                )
+                if val_metrics["psnr"] > best_psnr:
+                    best_psnr = val_metrics["psnr"]
+                    best_psnr_epoch = epoch
+                    improved = True
 
-        scheduler.step()
+            scheduler.step()
 
-    fin = f"Finished {epochs} epochs -> {run_dir}"
-    if ckpt_mgr.best_psnr_epoch >= 0:
-        best_line = f"Best PSNR: {ckpt_mgr.best_psnr:.4f} @ epoch {ckpt_mgr.best_psnr_epoch:03d}"
-    else:
-        best_line = "Best PSNR: N/A"
-    dual.log_both_plain(fin)
-    dual.log_both_plain(best_line)
-    _log_saved_artifacts(dual, run_dir)
+            checkpoint_metrics = dict(val_metrics)
+            checkpoint_metrics["train_loss"] = train_loss
+            checkpoint_metrics["val_loss"] = val_loss
+            payload = make_checkpoint(
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                config=config,
+                metrics=checkpoint_metrics,
+                best_psnr=best_psnr,
+                best_psnr_epoch=best_psnr_epoch,
+            )
+            save_checkpoint(payload, latest_path)
+            if improved:
+                save_checkpoint(payload, best_path)
 
+            epoch_time = time.perf_counter() - epoch_start
+            row = {
+                "epoch": epoch,
+                "train_loss": finite_text(train_loss),
+                "val_loss": finite_text(val_loss),
+                **{
+                    key: finite_text(train_components.get(key))
+                    for key in LOSS_KEYS
+                },
+                "PSNR": finite_text(val_metrics.get("psnr")),
+                "SSIM": finite_text(val_metrics.get("ssim")),
+                "SAM_deg": finite_text(val_metrics.get("sam")),
+                "RMSE": finite_text(val_metrics.get("rmse")),
+                "ERGAS": finite_text(val_metrics.get("ergas")),
+                "PSNR_coarse": finite_text(val_metrics.get("psnr_coarse")),
+                "PSNR_gain": finite_text(val_metrics.get("psnr_gain")),
+                "lr": f"{current_lr:.8e}",
+                "epoch_time_sec": f"{epoch_time:.3f}",
+            }
+            append_metrics(metrics_path, row)
 
-def _log_saved_artifacts(dual: TrainingDualLogger, run_dir: Path) -> None:
-    """Print final Saved list for artifacts that exist under ``run_dir``."""
-    names = (
-        "config.yaml",
-        "args.json",
-        "train_valid.log",
-        "train_valid_metrics.csv",
-        "latest.pth",
-        "best_psnr.pth",
-        "best_clean_psnr.pth",
-        "best_mean_psnr.pth",
-        "best_worst_case_psnr.pth",
-        "best_mean_heldout_psnr.pth",
-        "best_worst_heldout_psnr.pth",
-        "best_joint_heldout_psnr.pth",
-        "b10_best_tracker.json",
-        "best_sam.pth",
-        "best_ergas.pth",
-        "smoke_best_tracker.json",
-        "metrics_by_setting.csv",
-        "robust_ckpt_selection_meta.json",
-    )
-    dual.log_plain_file("Saved:")
-    dual.tty("Saved:")
-    for name in names:
-        if (run_dir / name).is_file():
-            dual.log_plain_file(f"  {name}")
-            dual.tty(f"  {name}")
+            if should_validate:
+                log(
+                    f"Epoch {epoch:03d}/{epochs:03d} | "
+                    f"train {train_loss:.6f} | val {val_loss:.6f} | "
+                    f"PSNR {val_metrics['psnr']:.4f} | "
+                    f"SSIM {val_metrics['ssim']:.6f} | "
+                    f"SAM {val_metrics['sam']:.4f} | "
+                    f"RMSE {val_metrics['rmse']:.6f} | "
+                    f"ERGAS {val_metrics['ergas']:.4f} | "
+                    f"lr {current_lr:.3e} | {epoch_time:.1f}s",
+                    log_file,
+                )
+            else:
+                log(
+                    f"Epoch {epoch:03d}/{epochs:03d} | "
+                    f"train {train_loss:.6f} | validation skipped | "
+                    f"lr {current_lr:.3e} | {epoch_time:.1f}s",
+                    log_file,
+                )
+
+            if improved:
+                log(
+                    f"Saved best_psnr.pth: PSNR={best_psnr:.6f} "
+                    f"at epoch {best_psnr_epoch}.",
+                    log_file,
+                )
+
+        elapsed_hours = (time.perf_counter() - training_start) / 3600.0
+        log("=" * 72, log_file)
+        log(f"Training finished in {elapsed_hours:.2f} hours.", log_file)
+        log(f"Latest checkpoint: {latest_path}", log_file)
+        if best_psnr_epoch >= 0:
+            log(
+                f"Best checkpoint: {best_path} "
+                f"(PSNR={best_psnr:.6f}, epoch={best_psnr_epoch})",
+                log_file,
+            )
+        log(f"Metrics: {metrics_path}", log_file)
+        log("=" * 72, log_file)
 
 
 if __name__ == "__main__":
