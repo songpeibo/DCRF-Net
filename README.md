@@ -11,13 +11,11 @@ residual feedback cell iterated for `T` steps (`num_feedback_steps` in config).
 | Path | Description |
 |------|-------------|
 | `models/` | DCRF-Net and feedback blocks |
-| `datasets/` | `baseline_export` and synthetic loaders |
+| `datasets/` | `baseline_export` |
 | `utils/` | Degradation operators, losses, metrics, training helpers |
 | `configs/` | Formal non-blind configs for PaviaU, Chikusei, Houston 2018 |
-| `scripts/` | `train.py`, `evaluate.py`, `infer.py` |
+| `scripts/` | `train.py`|
 | `baselines/` | Baseline model |
-| `docs/` | Dataset, reproduction, degradation, and baseline notes |
-| `examples/` | Example shell commands |
 
 ## Installation
 
