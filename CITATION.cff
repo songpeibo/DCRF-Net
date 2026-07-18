@@ -1,0 +1,6 @@
+cff-version: 1.2.0
+title: "DCRF-Net: Dual-Channel Residual Feedback Network for HSI-MSI Fusion"
+message: "If you use this software, please cite the accompanying paper."
+authors:
+  - family-names: "Authors"
+    given-names: "TBD"

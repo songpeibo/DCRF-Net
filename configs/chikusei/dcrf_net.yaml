@@ -1,0 +1,63 @@
+# B10-DCRF-2 Chikusei: B8 signed/detail guided backbone + dual-observation feedback refinement.
+# Protocol mirrors PaviaU formal B8/B10 (base128, e400, top_left); hsi_channels=128 for Chikusei.
+# Train from scratch — do not load PaviaU or other-dataset checkpoints.
+task: semi_blind_hsi_msi_fusion
+setting: nonblind_standard
+model: DCSRNet
+model_variant: b10_dcrf2_dual_observation_feedback
+
+seed: 42
+device: cuda
+
+data:
+  root: /path/to/baseline_export/chikusei
+  dataset: chikusei
+  split_mode: baseline_export
+  patch_size: 128
+  num_train_patches: 2048
+  scale: 4
+  hsi_channels: 128
+  msi_channels: 3
+  eval_crop_policy: top_left
+
+train:
+  epochs: 400
+  batch_size: 8
+  num_workers: 4
+  lr: 0.0002
+  weight_decay: 0.000001
+  amp: true
+  save_dir: outputs/runs/dcrf_net/chikusei
+  eval_every: 1
+  ckpt_metric: psnr
+  overwrite: false
+
+model_args:
+  hsi_channels: 128
+  msi_channels: 3
+  scale: 4
+  kernel_size: 5
+  base_channels: 128
+  delta_phi_scale: 0.0
+  delta_k_scale: 0.0
+  guidance_channels: 8
+  use_signed_residual_guidance: true
+  use_msi_detail_guidance: true
+  use_dual_observation_feedback: true
+  num_feedback_steps: 2
+  share_feedback_weights: true
+  feedback_residual_scale: 0.1
+  feedback_observation_mode: full
+
+loss:
+  lambda_rec: 1.0
+  lambda_rec_coarse: 0.2
+  lambda_obs: 0.1
+  lambda_obs_coarse: 0.05
+  lambda_sam: 0.02
+  lambda_deg: 0.0
+  lambda_sel: 0.0001
+  lambda_feedback_intermediate: 0.1
+
+  csv: table/nonblind/table_iii_baseline_results.csv
+  latex: table/nonblind/table_iii_latex_rows.txt
